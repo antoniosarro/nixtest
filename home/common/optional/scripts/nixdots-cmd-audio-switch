@@ -1,0 +1,98 @@
+#!/bin/bash
+
+#==============================================================================
+# Audio Sink Switcher with SwayOSD Notification
+#==============================================================================
+# This script cycles through available audio sinks (output devices) and
+# displays a notification using swayosd-client. It intelligently skips
+# unavailable devices and shows appropriate volume icons.
+#==============================================================================
+
+set -euo pipefail  # Exit on error, undefined variables, and pipe failures
+
+#------------------------------------------------------------------------------
+# Get the currently focused monitor for OSD display
+#------------------------------------------------------------------------------
+focused_monitor="$(hyprctl monitors -j | jq -r '.[] | select(.focused == true).name')"
+
+#------------------------------------------------------------------------------
+# Retrieve all available audio sinks (excluding unavailable ports)
+#------------------------------------------------------------------------------
+# Filter sinks to include only those with:
+# - No ports defined (virtual devices), OR
+# - At least one available port
+sinks=$(pactl -f json list sinks | \
+    jq '[.[] | select((.ports | length == 0) or 
+        ([.ports[]? | .availability != "not available"] | any))]')
+
+sinks_count=$(echo "$sinks" | jq 'length')
+
+#------------------------------------------------------------------------------
+# Handle case where no audio devices are available
+#------------------------------------------------------------------------------
+if [[ "$sinks_count" -eq 0 ]]; then
+    swayosd-client \
+        --monitor "$focused_monitor" \
+        --custom-message "No audio devices found"
+    exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Determine the next sink in the rotation
+#------------------------------------------------------------------------------
+current_sink_name=$(pactl get-default-sink)
+
+# Find the index of the current sink in our filtered list
+current_sink_index=$(echo "$sinks" | \
+    jq -r --arg name "$current_sink_name" 'map(.name) | index($name)')
+
+# Calculate next sink index (wrap around using modulo)
+if [[ "$current_sink_index" != "null" ]]; then
+    next_sink_index=$(( (current_sink_index + 1) % sinks_count ))
+else
+    # Current sink not in list (shouldn't happen), default to first sink
+    next_sink_index=0
+fi
+
+#------------------------------------------------------------------------------
+# Extract next sink properties
+#------------------------------------------------------------------------------
+next_sink=$(echo "$sinks" | jq -r ".[$next_sink_index]")
+next_sink_name=$(echo "$next_sink" | jq -r '.name')
+next_sink_description=$(echo "$next_sink" | jq -r '.description')
+
+# Extract volume percentage (from first channel)
+next_sink_volume=$(echo "$next_sink" | \
+    jq -r '.volume | to_entries[0].value.value_percent | sub("%"; "")')
+
+next_sink_is_muted=$(echo "$next_sink" | jq -r '.mute')
+
+#------------------------------------------------------------------------------
+# Determine appropriate volume icon based on mute status and volume level
+#------------------------------------------------------------------------------
+if [[ "$next_sink_is_muted" == "true" ]] || [[ "$next_sink_volume" -eq 0 ]]; then
+    icon_state="muted"
+elif [[ "$next_sink_volume" -le 33 ]]; then
+    icon_state="low"
+elif [[ "$next_sink_volume" -le 66 ]]; then
+    icon_state="medium"
+else
+    icon_state="high"
+fi
+
+next_sink_volume_icon="sink-volume-${icon_state}-symbolic"
+
+#------------------------------------------------------------------------------
+# Switch to the next sink if it's different from the current one
+#------------------------------------------------------------------------------
+if [[ "$next_sink_name" != "$current_sink_name" ]]; then
+    pactl set-default-sink "$next_sink_name"
+fi
+
+#------------------------------------------------------------------------------
+# Display OSD notification with sink info
+#------------------------------------------------------------------------------
+swayosd-client \
+    --monitor "$focused_monitor" \
+    --custom-message "$next_sink_description" \
+    --custom-icon "$next_sink_volume_icon"

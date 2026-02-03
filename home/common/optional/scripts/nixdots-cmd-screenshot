@@ -1,0 +1,184 @@
+#!/bin/bash
+
+# ==============================================================================
+# Screenshot Script with Multiple Modes and Editing Support
+# ==============================================================================
+# This script provides flexible screenshot capture with optional editing
+# Supports: region, windows, fullscreen, and smart selection modes
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Configuration and Setup
+# ------------------------------------------------------------------------------
+
+# Source user directories configuration to get XDG paths
+# shellcheck source=/dev/null
+[[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
+
+# Set output directory with fallback chain:
+# 1. OMARCHY_SCREENSHOT_DIR (custom env var)
+# 2. XDG_PICTURES_DIR (standard Pictures folder)
+# 3. $HOME/Pictures (absolute fallback)
+OUTPUT_DIR="${OMARCHY_SCREENSHOT_DIR:-${XDG_PICTURES_DIR:-$HOME/Pictures}}"
+
+# Verify output directory exists
+if [[ ! -d $OUTPUT_DIR ]]; then
+	notify-send "Screenshot" "Failed to create directory: $OUTPUT_DIR" -u critical -t 3000
+	exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Parameter Handling
+# ------------------------------------------------------------------------------
+
+# Kill any existing slurp process if no arguments provided (allows clean restart)
+# This prevents multiple selection windows from appearing simultaneously
+if [[ $# -eq 0 ]]; then
+	pkill slurp 2>/dev/null
+fi
+
+# Parse command-line arguments
+# MODE: How to capture (smart/region/windows/fullscreen)
+# PROCESSING: Whether to edit (editor) or copy directly (clipboard)
+MODE="${1:-smart}"
+PROCESSING="${2:-editor}"
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+# get_rectangles: Returns geometry of all monitors and windows on active workspace
+# Output format: "x,y widthxheight" (one per line)
+# Used for smart selection and window snapping
+get_rectangles() {
+	# Get the currently active workspace ID
+	local active_workspace
+	active_workspace=$(hyprctl monitors -j | jq -r '.[] | select(.focused == true) | .activeWorkspace.id')
+
+	# First, add all monitors that are on the active workspace
+	# Scale-adjusted dimensions ensure correct coordinates on HiDPI displays
+	hyprctl monitors -j | jq -r --arg ws "$active_workspace" \
+		'.[] | select(.activeWorkspace.id == ($ws | tonumber)) | "\(.x),\(.y) \((.width / .scale) | floor)x\((.height / .scale) | floor)"'
+
+	# Then, add all windows (clients) on the active workspace
+	# at[0] and at[1] are x,y position; size[0] and size[1] are width,height
+	hyprctl clients -j | jq -r --arg ws "$active_workspace" \
+		'.[] | select(.workspace.id == ($ws | tonumber)) | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"'
+}
+
+# ------------------------------------------------------------------------------
+# Selection Logic Based on Mode
+# ------------------------------------------------------------------------------
+
+case "$MODE" in
+region)
+	# Free-form region selection
+	# wayfreeze: Freezes screen to make selection easier on dynamic content
+	wayfreeze &
+	PID=$!
+	sleep .1 # Brief pause to ensure wayfreeze is active
+	SELECTION=$(slurp 2>/dev/null)
+	kill $PID 2>/dev/null # Clean up wayfreeze process
+	;;
+
+windows)
+	# Snap selection to window boundaries
+	# Shows only window rectangles, not free-form selection
+	wayfreeze &
+	PID=$!
+	sleep .1
+	SELECTION=$(get_rectangles | slurp -r 2>/dev/null) # -r flag restricts to provided rectangles
+	kill $PID 2>/dev/null
+	;;
+
+fullscreen)
+	# Capture entire focused monitor without user interaction
+	SELECTION=$(hyprctl monitors -j | jq -r '.[] | select(.focused == true) | "\(.x),\(.y) \((.width / .scale) | floor)x\((.height / .scale) | floor)"')
+	;;
+
+smart | *)
+	# Smart mode: Free selection that auto-snaps to windows for tiny selections
+	# This prevents accidental 1-2 pixel screenshots from quick clicks
+	RECTS=$(get_rectangles)
+	wayfreeze &
+	PID=$!
+	sleep .1
+	SELECTION=$(echo "$RECTS" | slurp 2>/dev/null)
+	kill $PID 2>/dev/null
+
+	# Parse selection to check if it's too small (likely an accidental click)
+	if [[ $SELECTION =~ ^([0-9]+),([0-9]+)[[:space:]]([0-9]+)x([0-9]+)$ ]]; then
+		# Calculate area: width * height
+		# If area < 20 pixels, assume user clicked to select a window/monitor
+		if ((BASH_REMATCH[3] * BASH_REMATCH[4] < 20)); then
+			click_x="${BASH_REMATCH[1]}" # X coordinate of click
+			click_y="${BASH_REMATCH[2]}" # Y coordinate of click
+
+			# Find which rectangle contains the click point
+			while IFS= read -r rect; do
+				if [[ $rect =~ ^([0-9]+),([0-9]+)[[:space:]]([0-9]+)x([0-9]+) ]]; then
+					rect_x="${BASH_REMATCH[1]}"
+					rect_y="${BASH_REMATCH[2]}"
+					rect_width="${BASH_REMATCH[3]}"
+					rect_height="${BASH_REMATCH[4]}"
+
+					# Check if click is inside this rectangle
+					if ((click_x >= rect_x && click_x < rect_x + rect_width && \
+						click_y >= rect_y && click_y < rect_y + rect_height)); then
+						# Snap to the full window/monitor rectangle
+						SELECTION="${rect_x},${rect_y} ${rect_width}x${rect_height}"
+						break
+					fi
+				fi
+			done <<<"$RECTS"
+		fi
+	fi
+	;;
+esac
+
+# ------------------------------------------------------------------------------
+# Exit if Selection Was Cancelled
+# ------------------------------------------------------------------------------
+
+# If user pressed ESC or closed slurp without selecting, exit gracefully
+[ -z "$SELECTION" ] && exit 0
+
+# ------------------------------------------------------------------------------
+# Generate Output Filename
+# ------------------------------------------------------------------------------
+
+# Create timestamp for unique filename
+TIMESTAMP=$(date +'%Y-%m-%d_%H-%M-%S')
+OUTPUT_FILE="$OUTPUT_DIR/11_Screenshot/02_Random/$TIMESTAMP.png"
+
+# ------------------------------------------------------------------------------
+# Process Screenshot Based on Processing Mode
+# ------------------------------------------------------------------------------
+
+if [[ $PROCESSING == "editor" ]]; then
+	# Editor mode: Capture, edit with satty, then save
+	# grim: Wayland screenshot tool
+	# -g: Specify geometry/region
+	# -: Output to stdout (piped to satty)
+	if grim -g "$SELECTION" - |
+		satty --filename - \
+			--output-filename "$OUTPUT_FILE" \
+			--early-exit \
+			--actions-on-enter save-to-clipboard \
+			--copy-command 'wl-copy' \
+			--save-after-copy; then
+
+		# Verify file was actually saved before showing notification
+		if [[ -f $OUTPUT_FILE ]]; then
+			notify-send "Screenshot" "Saved to $(basename "$OUTPUT_FILE")" -t 3000
+		fi
+	else
+		# Screenshot was cancelled in satty or grim failed
+		exit 1
+	fi
+else
+	# Clipboard mode: Capture and copy directly without editing
+	# Faster workflow for quick sharing
+	grim -g "$SELECTION" - | wl-copy
+	notify-send "Screenshot" "Copied to clipboard" -t 3000
+fi

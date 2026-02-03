@@ -1,0 +1,81 @@
+#!/bin/bash
+
+# Script: Launch default browser with proper private mode flag
+# Purpose: Opens the default browser with the correct private/incognito flag
+#          Handles NixOS-specific paths and various browser types
+
+set -euo pipefail
+
+# Get the default web browser .desktop file name
+default_browser=$(xdg-settings get default-web-browser)
+
+# NixOS-specific application search paths (in priority order)
+# Note: NixOS stores applications in different locations than traditional FHS systems
+search_paths=(
+    "$HOME/.local/share/applications"                   # User-specific applications
+    "$HOME/.nix-profile/share/applications"             # User profile applications
+    "/run/current-system/sw/share/applications"         # System-wide NixOS applications
+    "/etc/profiles/per-user/$USER/share/applications"   # Per-user profile
+    "/nix/var/nix/profiles/default/share/applications"  # Default Nix profile
+    "/usr/share/applications"                           # Fallback for non-NixOS apps
+)
+
+# Function to find and extract the Exec line from .desktop file
+find_browser_exec() {
+    local desktop_file="$1"
+    
+    for path in "${search_paths[@]}"; do
+        local full_path="$path/$desktop_file"
+        
+        if [[ -f "$full_path" ]]; then
+            # Extract executable from Exec= line, removing arguments and field codes (%u, %U, etc.)
+            # Example: "Exec=firefox %u" -> "firefox"
+            local exec_line
+            local browser
+
+            exec_line=$(grep -E '^Exec=' "$full_path" | head -1)
+            browser=$(echo "$exec_line" | sed -E 's/^Exec=([^ ]+).*/\1/')
+            
+            # Resolve if it's a wrapper script or symlink
+            if [[ -n "$browser" ]]; then
+                echo "$browser"
+                return 0
+            fi
+        fi
+    done
+    
+    return 1
+}
+
+# Find the browser executable
+browser_exec=$(find_browser_exec "$default_browser")
+
+# Verify we found a browser
+if [[ -z "$browser_exec" ]]; then
+    echo "Error: Could not find browser executable for: $default_browser" >&2
+    echo "Searched paths:" >&2
+    printf '  - %s\n' "${search_paths[@]}" >&2
+    exit 1
+fi
+
+# Determine the correct private browsing flag based on browser type
+# Extract browser name from path (handles both direct names and full paths)
+browser_name=$(basename "$browser_exec")
+
+case "$browser_name" in
+    firefox|firefox-*|librewolf|librewolf-*|zen|zen-*)
+        # Firefox-based browsers use --private-window
+        private_flag="--private-window"
+        ;;
+    chromium|chromium-*|chrome|google-chrome*|brave|brave-*)
+        # Chromium-based browsers use --incognito
+        private_flag="--incognito"
+        ;;
+    *)
+        # Default to incognito for unknown browsers (Chromium convention is more common)
+        private_flag="--incognito"
+        ;;
+esac
+
+# Launch browser in a new session (detached from terminal)
+exec setsid uwsm-app -- "$browser_exec" "${@/--private/$private_flag}" &>/dev/null &

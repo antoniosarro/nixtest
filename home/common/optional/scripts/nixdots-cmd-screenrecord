@@ -1,0 +1,273 @@
+#!/bin/bash
+
+# ==============================================================================
+# Screen Recording Script with Audio and Webcam Support
+# ==============================================================================
+# This script provides flexible screen recording capabilities using gpu-screen-recorder
+# Supports: full output/region recording, audio capture, and webcam overlay
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Configuration and Setup
+# ------------------------------------------------------------------------------
+
+# Source user directories configuration to get XDG paths
+# shellcheck source=/dev/null
+[[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
+
+# Set output directory with fallback chain:
+# 1. OMARCHY_SCREENRECORD_DIR (custom env var)
+# 2. XDG_VIDEOS_DIR (standard Videos folder)
+# 3. $HOME/Videos (absolute fallback)
+OUTPUT_DIR="${OMARCHY_SCREENRECORD_DIR:-${XDG_VIDEOS_DIR:-$HOME/Videos}}"
+
+# Verify output directory exists
+if [[ ! -d $OUTPUT_DIR ]]; then
+	notify-send "Screen Recording" "Directory does not exist: $OUTPUT_DIR" -u critical -t 3000
+	exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Parse Command-Line Arguments
+# ------------------------------------------------------------------------------
+
+# Initialize feature flags
+SCOPE=""       # Recording scope: "output" (monitor) or "region" (custom area)
+AUDIO="false"  # Whether to capture audio
+WEBCAM="false" # Whether to show webcam overlay
+
+# Parse all arguments
+for arg in "$@"; do
+	case "$arg" in
+	--with-audio)
+		AUDIO="true"
+		;;
+	--with-webcam)
+		WEBCAM="true"
+		;;
+	output | region)
+		SCOPE="$arg"
+		;;
+	esac
+done
+
+# ------------------------------------------------------------------------------
+# Webcam Overlay Functions
+# ------------------------------------------------------------------------------
+
+# cleanup_webcam: Terminate any running webcam overlay
+cleanup_webcam() {
+	pkill -f "WebcamOverlay" 2>/dev/null
+}
+
+# start_webcam_overlay: Display webcam feed in a floating window
+# Uses ffplay with v4l2 (Video4Linux2) to capture from /dev/video0
+# The overlay is automatically scaled to monitor DPI and uses 16:9 aspect ratio
+start_webcam_overlay() {
+	# Remove any existing webcam overlay first
+	cleanup_webcam
+
+	# Get current monitor's scale factor for HiDPI displays
+	local scale
+	scale=$(hyprctl monitors -j | jq -r '.[] | select(.focused == true) | .scale')
+
+	# Calculate target width scaled to monitor DPI (base: 360px)
+	local target_width
+	target_width=$(awk "BEGIN {printf \"%.0f\", 360 * $scale}")
+
+	# Preferred 16:9 resolutions to try (from lowest to highest)
+	# Will use the first one supported by the webcam
+	local preferred_resolutions=("640x360" "1280x720" "1920x1080")
+	local video_size_args=()
+
+	# Query available formats from webcam
+	local available_formats
+	available_formats=$(v4l2-ctl --list-formats-ext -d /dev/video0 2>/dev/null)
+
+	# Select first available preferred resolution
+	for resolution in "${preferred_resolutions[@]}"; do
+		if echo "$available_formats" | grep -q "$resolution"; then
+			video_size_args=(-video_size "$resolution")
+			break
+		fi
+	done
+
+	# Start ffplay with webcam feed
+	# -f v4l2: Use Video4Linux2 input format
+	# -framerate 30: Target 30 fps
+	# -vf "scale=...": Scale to target width, maintain aspect ratio
+	# -window_title: Set window title for easy identification/killing
+	# -noborder: Remove window decorations
+	# -fflags nobuffer -flags low_delay: Minimize latency
+	# -probesize/-analyzeduration: Reduce startup delay
+	# -loglevel quiet: Suppress ffplay output
+	ffplay -f v4l2 "${video_size_args[@]}" -framerate 30 /dev/video0 \
+		-vf "scale=${target_width}:-1" \
+		-window_title "WebcamOverlay" \
+		-noborder \
+		-fflags nobuffer -flags low_delay \
+		-probesize 32 -analyzeduration 0 \
+		-loglevel quiet &
+
+	# Brief pause to ensure ffplay window appears before recording starts
+	sleep 1
+}
+
+# ------------------------------------------------------------------------------
+# Screen Recording Control Functions
+# ------------------------------------------------------------------------------
+
+# start_screenrecording: Begin recording with gpu-screen-recorder
+# Arguments: Passed through to gpu-screen-recorder (output name or region spec)
+start_screenrecording() {
+	# Generate timestamped filename
+	local filename
+	filename="$OUTPUT_DIR/screenrecording-$(date +'%Y-%m-%d_%H-%M-%S').mp4"
+
+	local audio_args=()
+
+	# Configure audio capture if requested
+	# Merges desktop output and microphone input into a single audio track
+	# (separate tracks only play one at a time in most players)
+	[[ $AUDIO == "true" ]] && audio_args=(-a "default_output|default_input")
+
+	# Start gpu-screen-recorder in background
+	# -w: Window/output/region to record (passed as $@)
+	# -f 60: 60 fps frame rate
+	# -c mp4: Output container format
+	# -o: Output filename
+	# $audio_args: Audio sources (if enabled)
+	gpu-screen-recorder -w "$@" -f 60 -c mp4 -o "$filename" "${audio_args[@]}" &
+
+	# Update waybar indicator to show recording is active
+	toggle_screenrecording_indicator
+}
+
+# stop_screenrecording: Gracefully stop recording and cleanup
+# Sends SIGINT to allow proper video finalization, then force-kills if needed
+stop_screenrecording() {
+	# Send SIGINT (Ctrl+C equivalent) to gpu-screen-recorder
+	# SIGINT is required for proper video file finalization
+	pkill -SIGINT -f "gpu-screen-recorder"
+
+	# Wait up to 5 seconds for graceful shutdown
+	local count=0
+	while pgrep -f "gpu-screen-recorder" >/dev/null && [ $count -lt 50 ]; do
+		sleep 0.1
+		count=$((count + 1))
+	done
+
+	# Check if process is still running after grace period
+	if pgrep -f "gpu-screen-recorder" >/dev/null; then
+		# Force kill if graceful shutdown failed
+		pkill -9 -f "gpu-screen-recorder"
+		cleanup_webcam
+		notify-send "Screen Recording" "Recording process had to be force-killed. Video may be corrupted." -u critical -t 5000
+	else
+		# Normal shutdown completed
+		cleanup_webcam
+		notify-send "Screen Recording" "Saved to $OUTPUT_DIR" -t 2000
+	fi
+
+	# Update waybar indicator to show recording stopped
+	toggle_screenrecording_indicator
+}
+
+# toggle_screenrecording_indicator: Send signal to waybar to update recording status
+# Waybar module should listen for RTMIN+8 signal to update its display
+toggle_screenrecording_indicator() {
+	pkill -RTMIN+8 waybar
+}
+
+# screenrecording_active: Check if any recording-related process is running
+# Returns: 0 (true) if active, 1 (false) if not
+screenrecording_active() {
+	pgrep -f "gpu-screen-recorder" >/dev/null ||
+		pgrep -x slurp >/dev/null ||
+		pgrep -f "WebcamOverlay" >/dev/null
+}
+
+# ------------------------------------------------------------------------------
+# Main Logic: Start, Stop, or Toggle Recording
+# ------------------------------------------------------------------------------
+
+if screenrecording_active; then
+	# Recording or selection is already active - determine what to stop
+
+	if pgrep -x slurp >/dev/null; then
+		# User is still selecting region - cancel selection
+		pkill -x slurp 2>/dev/null
+
+	elif pgrep -f "WebcamOverlay" >/dev/null && ! pgrep -f "gpu-screen-recorder" >/dev/null; then
+		# Webcam overlay is active but recording hasn't started yet - cleanup
+		cleanup_webcam
+
+	else
+		# Recording is active - stop it
+		stop_screenrecording
+	fi
+
+elif [[ $SCOPE == "output" ]]; then
+	# ------------------------------------------------------------------------------
+	# Output (Monitor) Recording Mode
+	# ------------------------------------------------------------------------------
+
+	# Start webcam overlay if requested
+	[[ $WEBCAM == "true" ]] && start_webcam_overlay
+
+	# Let user select which monitor to record
+	# -o: Only show monitor outputs
+	# -f "%o": Return output name format
+	if ! output=$(slurp -o -f "%o"); then
+		# User cancelled selection - cleanup
+		[[ $WEBCAM == "true" ]] && cleanup_webcam
+		exit 1
+	fi
+
+	# Validate output selection
+	if [[ -z $output ]]; then
+		notify-send "Screen Recording" "Could not detect monitor" -u critical -t 3000
+		[[ $WEBCAM == "true" ]] && cleanup_webcam
+		exit 1
+	fi
+
+	# Start recording the selected output
+	start_screenrecording "$output"
+
+else
+	# ------------------------------------------------------------------------------
+	# Region Recording Mode (default)
+	# ------------------------------------------------------------------------------
+
+	# Start webcam overlay if requested
+	[[ $WEBCAM == "true" ]] && start_webcam_overlay
+
+	# Get monitor scale for coordinate conversion
+	scale=$(hyprctl monitors -j | jq -r '.[] | select(.focused == true) | .scale')
+
+	# Let user select region to record
+	# -f "%wx%h+%x+%y": Return region in WxH+X+Y format
+	if ! region=$(slurp -f "%wx%h+%x+%y"); then
+		# User cancelled selection - cleanup
+		[[ $WEBCAM == "true" ]] && cleanup_webcam
+		exit 1
+	fi
+
+	# Parse and scale region coordinates for HiDPI displays
+	# gpu-screen-recorder expects physical pixels, not logical pixels
+	if [[ $region =~ ^([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)$ ]]; then
+		# Extract width, height, x, y from regex match
+		# Scale each component by monitor scale factor
+		w=$(awk "BEGIN {printf \"%.0f\", ${BASH_REMATCH[1]} * $scale}")
+		h=$(awk "BEGIN {printf \"%.0f\", ${BASH_REMATCH[2]} * $scale}")
+		x=$(awk "BEGIN {printf \"%.0f\", ${BASH_REMATCH[3]} * $scale}")
+		y=$(awk "BEGIN {printf \"%.0f\", ${BASH_REMATCH[4]} * $scale}")
+		scaled_region="${w}x${h}+${x}+${y}"
+	else
+		# Fallback: use unscaled region if parsing fails
+		scaled_region="$region"
+	fi
+
+	# Start recording the selected region
+	start_screenrecording region -region "$scaled_region"
+fi

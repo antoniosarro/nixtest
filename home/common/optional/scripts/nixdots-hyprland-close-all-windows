@@ -1,0 +1,24 @@
+#!/bin/bash
+
+#==============================================================================
+# Hyprland Window Cleanup Script
+#==============================================================================
+# This script closes all open windows in Hyprland and switches to workspace 1.
+# Useful for quickly resetting your workspace to a clean state.
+#==============================================================================
+
+set -euo pipefail  # Exit on error, undefined variables, and pipe failures
+
+#------------------------------------------------------------------------------
+# Close all open windows
+#------------------------------------------------------------------------------
+# Get all client addresses and close each window by its address
+# Note: This will close ALL windows without confirmation
+hyprctl clients -j | \
+    jq -r '.[].address' | \
+    xargs -I{} hyprctl dispatch closewindow address:{}
+
+#------------------------------------------------------------------------------
+# Switch to workspace 1
+#------------------------------------------------------------------------------
+hyprctl dispatch workspace 1
