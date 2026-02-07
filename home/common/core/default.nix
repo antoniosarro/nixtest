@@ -11,7 +11,7 @@ in
 {
   imports = lib.flatten [
     (map lib.custom.relativeToRoot [
-      "modules/common/host-spec.nix"
+      "modules/common"
       "modules/home"
     ])
 

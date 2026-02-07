@@ -31,6 +31,9 @@
     username = "antoniosarro";
     users = [ "antoniosarro" ];
     handle = "antoniosarro";
+    email = {
+      github = "contact@antoniosarro.dev";
+    };
   };
 
   networking.hostName = config.hostSpec.hostName;

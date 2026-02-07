@@ -7,6 +7,6 @@
   imports = [
     ./chromium.nix
     ./firefox.nix
-    ./zen.nix
+    # ./zen.nix
   ];
 }

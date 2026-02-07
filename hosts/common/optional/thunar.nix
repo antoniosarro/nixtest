@@ -12,7 +12,6 @@
       };
     };
     xfconf.enable = true; # persist Thunar settings
-    file-roller.enable = true; # required for Thunar archive plugin
   };
 
   services = {

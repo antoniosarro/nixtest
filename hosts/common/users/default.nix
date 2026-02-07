@@ -83,7 +83,7 @@ in
                 map (fullPathIfExists) [
                   "home/${user}/${hostSpec.hostName}.nix"
                   "home/${user}/common"
-                  "home/${user}/common/${platform}.nix"
+                  "home/${user}/common/nixos.nix"
                 ]
               ))
               (

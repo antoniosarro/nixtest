@@ -16,7 +16,7 @@
       libreoffice
       obsidian
       # Security
-      bitwarden
+      bitwarden-desktop
       # Media
       freetube
       # VM
